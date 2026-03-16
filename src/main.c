@@ -78,6 +78,21 @@ static void on_message_create(struct discord *client,
   commands_handle_message(client, event);
 }
 
+/**
+ * Handle VOICE_STATE_UPDATE events.
+ * 
+ * FIX: Added this handler to track when users join/leave voice channels.
+ * This is required because the new Concord API does not expose voice
+ * state through the message event's member struct.
+ * 
+ * We pass these events to voice_on_voice_state_update() which updates
+ * our internal mapping of user_id -> channel_id.
+ */
+static void on_voice_state_update(struct discord *client,
+                                 const struct discord_voice_state *event) {
+  voice_on_voice_state_update(client, event);
+}
+
 int main(void) {
   BotConfig cfg = {0};
 
@@ -99,6 +114,13 @@ int main(void) {
 
   discord_set_on_ready(client, &on_ready);
   discord_set_on_message_create(client, &on_message_create);
+  
+  /**
+   * FIX: Register the VOICE_STATE_UPDATE event handler.
+   * This is required to track which voice channel users are in,
+   * replacing the old member->voice->channel_id approach.
+   */
+  discord_set_on_voice_state_update(client, &on_voice_state_update);
 
   discord_run(client);
 
