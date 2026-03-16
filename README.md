@@ -1,76 +1,90 @@
-# SUB Music (C Discord Music Bot)
+# SUB Music (C + Discord Gateway + Lavalink)
 
-SUB Music is a Discord music bot written in C with command prefix `s!`.
+SUB Music is a lightweight Discord music bot written in C.
+It **does not use Concord** and avoids implementing Discord voice/audio protocols directly.
 
-It supports:
-- `s!p <youtube_link_or_song_name>`
-- `s!skip`
-- `s!stop`
-- `s!leave`
-- `s!help`
+Instead:
+- The bot handles Discord Gateway events and commands.
+- Lavalink handles YouTube extraction (`yt-dlp`) and voice streaming.
 
-## Features
-
-- Joins the requester's voice channel
-- Plays YouTube links directly
-- Searches YouTube when a text query is provided (`ytsearch1:`)
-- Queue support (up to 100 songs)
-- Skip, stop, and leave controls
-- Modular C project layout for scaling
-
-## Project Structure
+## Architecture
 
 ```text
-sub-music-bot/
-│
+Discord Gateway (WebSocket)
+      |
+      v
+ src/discord_gateway.c
+      |
+      v
+ src/commands.c  ---> src/queue.c
+      |
+      v
+ src/lavalink_client.c (REST via libcurl)
+      |
+      v
+ Lavalink v4 server
+```
+
+### Responsibilities
+
+- `discord_gateway.c`
+  - Connects to `wss://gateway.discord.gg`
+  - Sends IDENTIFY + heartbeat
+  - Receives dispatch events (`READY`, `MESSAGE_CREATE`, `VOICE_STATE_UPDATE`)
+  - Sends voice state updates (join/leave channel)
+
+- `commands.c`
+  - Parses `s!` commands
+  - Supports:
+    - `s!p <song or link>`
+    - `s!skip`
+    - `s!stop`
+    - `s!leave`
+    - `s!help`
+  - Calls Lavalink REST API and queue manager
+
+- `lavalink_client.c`
+  - Uses `GET /v4/loadtracks?identifier=ytsearch:QUERY`
+  - Uses `PATCH /v4/sessions/{sessionId}/players/{guildId}`
+
+- `queue.c`
+  - In-memory per-guild queue
+
+## Project layout
+
+```text
+sub-music/
 ├── src/
 │   ├── main.c
+│   ├── discord_gateway.c
+│   ├── discord_gateway.h
 │   ├── commands.c
 │   ├── commands.h
-│   ├── music_player.c
-│   ├── music_player.h
-│   ├── youtube.c
-│   ├── youtube.h
-│   └── voice.c
+│   ├── lavalink_client.c
+│   ├── lavalink_client.h
+│   ├── queue.c
+│   ├── queue.h
 │
-├── include/
 ├── config/
 │   └── config.json
+│
 ├── scripts/
 │   └── run.sh
+│
 ├── Makefile
 └── README.md
 ```
 
 ## Dependencies
 
-Install runtime/build dependencies on Linux:
+Install development packages (names may vary by distro):
 
-```bash
-sudo apt update
-sudo apt install -y ffmpeg yt-dlp libsodium-dev libopus-dev libcurl4-openssl-dev
-```
-
-Install Concord library from source:
-
-```bash
-git clone https://github.com/Cogmasters/concord.git
-cd concord
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
-sudo cmake --install build
-```
-
-## Configure
-
-Edit `config/config.json`:
-
-```json
-{
-  "token": "YOUR_DISCORD_BOT_TOKEN",
-  "prefix": "s!"
-}
-```
+- `libwebsockets`
+- `libcurl`
+- `jansson`
+- `pkg-config`
+- `make`
+- `gcc`
 
 ## Build
 
@@ -78,38 +92,54 @@ Edit `config/config.json`:
 make
 ```
 
-## Run
+Output binary:
 
 ```bash
 ./submusic
 ```
 
-or:
+## Configuration
 
-```bash
-./scripts/run.sh
+Edit `config/config.json`:
+
+```json
+{
+  "discord": {
+    "token": "YOUR_DISCORD_BOT_TOKEN",
+    "intents": "513"
+  },
+  "lavalink": {
+    "host": "127.0.0.1",
+    "port": 2333,
+    "password": "youshallnotpass"
+  }
+}
 ```
 
-## Commands
+- `intents=513` enables guild messages + message content. If you need voice-state tracking reliability, include voice-state intent as needed in your bot/app settings and intent bitmask.
 
-- `s!p <song or link>` → Play music
-- `s!skip` → Skip current song
-- `s!stop` → Stop playback and clear queue
-- `s!leave` → Leave voice channel
-- `s!help` → Show command help
+## Run Lavalink
 
-## Audio Pipeline
+Use a Lavalink v4 setup (Java 17+), with a matching `application.yml` password and `yt-dlp` support.
 
-Playback flow:
+Typical steps:
 
-1. Resolve YouTube URL/title with `yt-dlp` (`--get-url --get-title`).
-2. Stream best audio and decode to PCM with FFmpeg:
-   - `yt-dlp -f bestaudio -o - ... | ffmpeg -i pipe:0 -f s16le -ar 48000 -ac 2 pipe:1`
-3. Encode PCM frames to Opus.
-4. Send Opus frames through Discord voice transport layer.
+1. Download Lavalink v4 jar
+2. Provide `application.yml` with:
+   - `server.port: 2333`
+   - `lavalink.server.password: youshallnotpass`
+3. Start:
+   ```bash
+   java -jar Lavalink.jar
+   ```
+
+Then run SUB Music:
+
+```bash
+scripts/run.sh
+```
 
 ## Notes
 
-- The `voice_send_opus_frame()` hook in `src/voice.c` is where you bind Concord's voice packet send call for your installed Concord version.
-- The rest of the bot (commands, queueing, yt-dlp/ffmpeg pipeline, Opus encoding, threading) is implemented and ready.
-- Logging is printed to stdout for ready state and now playing events.
+- Audio playback/streaming is fully handled by Lavalink.
+- This implementation focuses on a simplified architecture and keeps bot logic lightweight in C.

@@ -1,132 +1,96 @@
 #include "commands.h"
-#include "music_player.h"
-#include "voice.h"
+#include "discord_gateway.h"
+#include "lavalink_client.h"
+#include "queue.h"
 
-#include <concord/discord.h>
-#include <stdbool.h>
+#include <curl/curl.h>
+#include <jansson.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
-typedef struct {
-  char token[512];
-  char prefix[16];
-} BotConfig;
+static int load_config(const char *path,
+                       char *token,
+                       size_t token_sz,
+                       char *ll_host,
+                       size_t ll_host_sz,
+                       int *ll_port,
+                       char *ll_password,
+                       size_t ll_password_sz,
+                       char *intents,
+                       size_t intents_sz) {
+    json_error_t err;
+    json_t *root = json_load_file(path, 0, &err);
+    if (!root) {
+        fprintf(stderr, "Failed to load config: %s\n", err.text);
+        return -1;
+    }
 
-static bool parse_json_value(const char *json, const char *key, char *out,
-                             size_t out_sz) {
-  char pattern[64];
-  snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    json_t *discord = json_object_get(root, "discord");
+    json_t *lavalink = json_object_get(root, "lavalink");
 
-  const char *k = strstr(json, pattern);
-  if (!k) return false;
+    const char *token_v = json_string_value(json_object_get(discord, "token"));
+    const char *intents_v = json_string_value(json_object_get(discord, "intents"));
+    const char *host_v = json_string_value(json_object_get(lavalink, "host"));
+    const char *pass_v = json_string_value(json_object_get(lavalink, "password"));
+    int port_v = (int)json_integer_value(json_object_get(lavalink, "port"));
 
-  const char *colon = strchr(k, ':');
-  if (!colon) return false;
+    if (!token_v || !intents_v || !host_v || !pass_v || !port_v) {
+        json_decref(root);
+        return -1;
+    }
 
-  const char *start = strchr(colon, '"');
-  if (!start) return false;
-  start++;
+    snprintf(token, token_sz, "%s", token_v);
+    snprintf(intents, intents_sz, "%s", intents_v);
+    snprintf(ll_host, ll_host_sz, "%s", host_v);
+    snprintf(ll_password, ll_password_sz, "%s", pass_v);
+    *ll_port = port_v;
 
-  const char *end = strchr(start, '"');
-  if (!end) return false;
-
-  size_t len = (size_t)(end - start);
-  if (len >= out_sz) len = out_sz - 1;
-  memcpy(out, start, len);
-  out[len] = '\0';
-  return true;
-}
-
-static bool load_config(const char *path, BotConfig *cfg) {
-  FILE *fp = fopen(path, "r");
-  if (!fp) return false;
-
-  fseek(fp, 0, SEEK_END);
-  long size = ftell(fp);
-  fseek(fp, 0, SEEK_SET);
-
-  if (size <= 0 || size > 8192) {
-    fclose(fp);
-    return false;
-  }
-
-  char *buf = calloc((size_t)size + 1, 1);
-  if (!buf) {
-    fclose(fp);
-    return false;
-  }
-
-  fread(buf, 1, (size_t)size, fp);
-  fclose(fp);
-
-  bool ok = parse_json_value(buf, "token", cfg->token, sizeof(cfg->token));
-  bool pfx = parse_json_value(buf, "prefix", cfg->prefix, sizeof(cfg->prefix));
-  free(buf);
-
-  return ok && pfx;
-}
-
-static void on_ready(struct discord *client, const struct discord_ready *event) {
-  (void)client;
-  printf("[READY] Logged in as %s#%s\n", event->user->username,
-         event->user->discriminator);
-}
-
-static void on_message_create(struct discord *client,
-                              const struct discord_message *event) {
-  commands_handle_message(client, event);
-}
-
-/**
- * Handle VOICE_STATE_UPDATE events.
- * 
- * FIX: Added this handler to track when users join/leave voice channels.
- * This is required because the new Concord API does not expose voice
- * state through the message event's member struct.
- * 
- * We pass these events to voice_on_voice_state_update() which updates
- * our internal mapping of user_id -> channel_id.
- */
-static void on_voice_state_update(struct discord *client,
-                                 const struct discord_voice_state *event) {
-  voice_on_voice_state_update(client, event);
+    json_decref(root);
+    return 0;
 }
 
 int main(void) {
-  BotConfig cfg = {0};
+    char token[256], ll_host[256], ll_password[128], intents[32];
+    int ll_port = 2333;
 
-  if (!load_config("config/config.json", &cfg)) {
-    fprintf(stderr, "Failed to load config/config.json\n");
-    return 1;
-  }
+    if (load_config("config/config.json", token, sizeof(token), ll_host, sizeof(ll_host), &ll_port, ll_password, sizeof(ll_password), intents, sizeof(intents)) != 0) {
+        fprintf(stderr, "Invalid config/config.json\n");
+        return 1;
+    }
 
-  commands_set_prefix(cfg.prefix);
+    curl_global_init(CURL_GLOBAL_DEFAULT);
 
-  struct discord *client = discord_config_init("config/config.json");
-  if (!client) {
-    fprintf(stderr, "Failed to initialize Concord client\n");
-    return 1;
-  }
+    lavalink_client_t lavalink;
+    lavalink_client_init(&lavalink, ll_host, ll_port, ll_password);
 
-  voice_init(client);
-  music_player_init();
+    queue_manager_t queues;
+    queue_manager_init(&queues);
 
-  discord_set_on_ready(client, &on_ready);
-  discord_set_on_message_create(client, &on_message_create);
-  
-  /**
-   * FIX: Register the VOICE_STATE_UPDATE event handler.
-   * This is required to track which voice channel users are in,
-   * replacing the old member->voice->channel_id approach.
-   */
-  discord_set_on_voice_state_update(client, &on_voice_state_update);
+    command_context_t commands;
+    commands_init(&commands, "s!", &lavalink, &queues);
 
-  discord_run(client);
+    discord_gateway_config_t gateway_cfg;
+    snprintf(gateway_cfg.token, sizeof(gateway_cfg.token), "%s", token);
+    snprintf(gateway_cfg.intents_str, sizeof(gateway_cfg.intents_str), "%s", intents);
 
-  music_player_shutdown();
-  voice_shutdown();
-  discord_cleanup(client);
+    discord_gateway_t gateway;
+    if (discord_gateway_init(&gateway, &gateway_cfg, commands_handle_dispatch, &commands) != 0) {
+        fprintf(stderr, "Failed to init Discord Gateway\n");
+        return 1;
+    }
 
-  return 0;
+    if (discord_gateway_connect(&gateway) != 0) {
+        fprintf(stderr, "Failed to connect to Discord Gateway\n");
+        discord_gateway_close(&gateway);
+        return 1;
+    }
+
+    fprintf(stderr, "SUB Music started. Prefix: s!\n");
+    discord_gateway_run(&gateway);
+
+    discord_gateway_close(&gateway);
+    commands_cleanup(&commands);
+    queue_manager_free(&queues);
+    curl_global_cleanup();
+    return 0;
 }

@@ -1,4 +1,11 @@
 {
-  "token": "YOUR_DISCORD_BOT_TOKEN",
-  "prefix": "s!"
+  "discord": {
+    "token": "YOUR_DISCORD_BOT_TOKEN",
+    "intents": "513"
+  },
+  "lavalink": {
+    "host": "127.0.0.1",
+    "port": 2333,
+    "password": "youshallnotpass"
+  }
 }
