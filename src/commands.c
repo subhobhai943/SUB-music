@@ -1,146 +1,225 @@
 #include "commands.h"
 
-#include "music_player.h"
-#include "voice.h"
-#include "youtube.h"
-
-#include <concord/discord.h>
-#include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-static char g_prefix[16] = "s!";
-
-/**
- * Send a text message to a channel.
- *
- * FIX: Added const qualifier to the text parameter.
- * The Concord API requires const char* for the content field.
- * This fixes "initialization discards const qualifier" warnings.
- */
-static void send_text(struct discord *client, u64snowflake channel_id,
-                      const char *text) {
-    struct discord_create_message params = {
-        .content = text
-    };
-    discord_create_message(client, channel_id, &params, NULL);
+static char *dupstr(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *d = malloc(n);
+    if (d) memcpy(d, s, n);
+    return d;
 }
 
-void commands_set_prefix(const char *prefix) {
-    if (!prefix || !*prefix) return;
-    snprintf(g_prefix, sizeof(g_prefix), "%s", prefix);
+static voice_state_entry_t *find_voice(command_context_t *ctx, const char *guild_id, const char *user_id, int create) {
+    voice_state_entry_t *cur = ctx->voice_states;
+    while (cur) {
+        if (strcmp(cur->guild_id, guild_id) == 0 && strcmp(cur->user_id, user_id) == 0) {
+            return cur;
+        }
+        cur = cur->next;
+    }
+    if (!create) return NULL;
+
+    voice_state_entry_t *entry = calloc(1, sizeof(*entry));
+    if (!entry) return NULL;
+    snprintf(entry->guild_id, sizeof(entry->guild_id), "%s", guild_id);
+    snprintf(entry->user_id, sizeof(entry->user_id), "%s", user_id);
+    entry->next = ctx->voice_states;
+    ctx->voice_states = entry;
+    return entry;
 }
 
-static void command_help(struct discord *client, const struct discord_message *event) {
-    const char *help =
-        "**SUB Music Commands**\n"
-        "`s!p <song or link>`  → Play music\n"
-        "`s!skip`              → Skip song\n"
-        "`s!stop`              → Stop playback\n"
-        "`s!leave`             → Leave voice channel\n"
-        "`s!help`              → Show commands";
-    send_text(client, event->channel_id, help);
+static void handle_voice_state_update(command_context_t *ctx, json_t *payload) {
+    const char *guild_id = json_string_value(json_object_get(payload, "guild_id"));
+    const char *channel_id = json_string_value(json_object_get(payload, "channel_id"));
+    json_t *user = json_object_get(payload, "user_id");
+
+    if (!guild_id || !json_is_string(user)) return;
+    const char *user_id = json_string_value(user);
+
+    voice_state_entry_t *entry = find_voice(ctx, guild_id, user_id, 1);
+    if (!entry) return;
+    snprintf(entry->channel_id, sizeof(entry->channel_id), "%s", channel_id ? channel_id : "");
 }
 
-/**
- * Get the voice channel ID for the command author.
- *
- * FIX: Replaced the old member->voice->channel_id approach.
- * 
- * Old (broken) code:
- *   if (!event->member || !event->member->voice) return 0;
- *   return event->member->voice->channel_id;
- *
- * The new Concord API does not expose voice state through the message
- * event's member struct. Instead, we track voice states by listening
- * to VOICE_STATE_UPDATE events and maintain our own mapping.
- */
-static uint64_t get_voice_channel_for_user(const struct discord_message *event) {
-    if (!event->guild_id || !event->author)
-        return 0;
-
-    uint64_t guild_id = event->guild_id;
-    uint64_t user_id = event->author->id;
-
-    return voice_get_user_channel(guild_id, user_id);
+static const char *user_voice_channel(command_context_t *ctx, const char *guild_id, const char *user_id) {
+    voice_state_entry_t *entry = find_voice(ctx, guild_id, user_id, 0);
+    if (!entry || entry->channel_id[0] == '\0') return NULL;
+    return entry->channel_id;
 }
 
-void commands_handle_message(struct discord *client,
-                             const struct discord_message *event) {
-    if (!event || !event->content || !event->author) return;
-    if (event->author->bot) return;
+static void send_text_feedback(const char *text) {
+    fprintf(stderr, "[SUB Music] %s\n", text);
+}
 
-    size_t pfx = strlen(g_prefix);
-    if (strncmp(event->content, g_prefix, pfx) != 0) return;
-
-    const char *input = event->content + pfx;
-
-    if (strncmp(input, "help", 4) == 0) {
-        command_help(client, event);
+static void handle_play(command_context_t *ctx, const char *guild_id, const char *user_id, const char *arg) {
+    if (!arg || arg[0] == '\0') {
+        send_text_feedback("Usage: s!p <youtube link or search query>");
         return;
     }
 
-    if (strncmp(input, "skip", 4) == 0) {
-        char status[256];
-        music_skip(event->guild_id, status, sizeof(status));
-        send_text(client, event->channel_id, status);
+    lavalink_track_result_t result;
+    if (lavalink_search_track(ctx->lavalink, arg, &result) != 0) {
+        send_text_feedback("No results found in Lavalink.");
         return;
     }
 
-    if (strncmp(input, "stop", 4) == 0) {
-        char status[256];
-        music_stop(event->guild_id, status, sizeof(status));
-        send_text(client, event->channel_id, status);
+    if (queue_push(ctx->queues, guild_id, result.track, result.title) != 0) {
+        send_text_feedback("Failed to queue track.");
         return;
     }
 
-    if (strncmp(input, "leave", 5) == 0) {
-        char status[256];
-        music_leave(event->guild_id, status, sizeof(status));
-        send_text(client, event->channel_id, status);
+    const char *voice_channel = user_voice_channel(ctx, guild_id, user_id);
+    if (voice_channel) {
+        send_text_feedback("Joining user's voice channel...");
+    }
+
+    if (voice_channel) {
+        /* Voice gateway update happens in caller with discord handle. */
+    }
+
+    track_item_t *current = queue_peek(ctx->queues, guild_id);
+    if (current && lavalink_play_track(ctx->lavalink, guild_id, current->track) == 0) {
+        send_text_feedback("Track sent to Lavalink player.");
+    } else {
+        send_text_feedback("Could not start playback on Lavalink.");
+    }
+}
+
+static void handle_skip(command_context_t *ctx, const char *guild_id) {
+    track_item_t *old = queue_pop(ctx->queues, guild_id);
+    if (old) {
+        free(old->track);
+        free(old->title);
+        free(old);
+    }
+
+    track_item_t *next = queue_peek(ctx->queues, guild_id);
+    if (!next) {
+        lavalink_stop(ctx->lavalink, guild_id);
+        send_text_feedback("Queue empty. Playback stopped.");
         return;
     }
 
-    if (strncmp(input, "p ", 2) == 0) {
-        const char *query = input + 2;
-        if (!*query) {
-            send_text(client, event->channel_id, "Usage: s!p <youtube_link_or_song_name>");
-            return;
+    if (lavalink_play_track(ctx->lavalink, guild_id, next->track) == 0) {
+        send_text_feedback("Skipped to next song.");
+    } else {
+        send_text_feedback("Failed to play next song.");
+    }
+}
+
+static void handle_stop(command_context_t *ctx, const char *guild_id) {
+    queue_clear(ctx->queues, guild_id);
+    if (lavalink_stop(ctx->lavalink, guild_id) == 0) {
+        send_text_feedback("Playback stopped and queue cleared.");
+    }
+}
+
+static void handle_leave(command_context_t *ctx, discord_gateway_t *gw, const char *guild_id) {
+    queue_clear(ctx->queues, guild_id);
+    lavalink_leave(ctx->lavalink, guild_id);
+    discord_gateway_update_voice_state(gw, guild_id, NULL);
+    send_text_feedback("Left voice channel.");
+}
+
+static void handle_help(void) {
+    send_text_feedback("Commands: s!p <song|link>, s!skip, s!stop, s!leave, s!help");
+}
+
+void commands_init(command_context_t *ctx, const char *prefix, lavalink_client_t *lavalink, queue_manager_t *queues) {
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->prefix = prefix;
+    ctx->lavalink = lavalink;
+    ctx->queues = queues;
+}
+
+void commands_set_bot_user(command_context_t *ctx, const char *bot_user_id) {
+    ctx->bot_user_id = bot_user_id;
+}
+
+void commands_handle_dispatch(discord_gateway_t *gw, const char *event_name, json_t *payload, void *userdata) {
+    command_context_t *ctx = (command_context_t *)userdata;
+
+    if (strcmp(event_name, "READY") == 0) {
+        const char *session_id = json_string_value(json_object_get(payload, "session_id"));
+        if (session_id) {
+            lavalink_client_set_session(ctx->lavalink, session_id);
         }
-
-        /**
-         * FIX: Use voice_get_user_channel() instead of member->voice->channel_id.
-         * 
-         * This function looks up the user's voice channel from our
-         * tracked voice states (populated via VOICE_STATE_UPDATE events).
-         */
-        uint64_t voice_channel_id = get_voice_channel_for_user(event);
-        if (!voice_channel_id) {
-            send_text(client, event->channel_id,
-                     "Join a voice channel first, then use `s!p ...`");
-            return;
+        json_t *user = json_object_get(payload, "user");
+        const char *user_id = user ? json_string_value(json_object_get(user, "id")) : NULL;
+        if (user_id) {
+            commands_set_bot_user(ctx, dupstr(user_id));
         }
-
-        char err[128];
-        if (!voice_join(event->guild_id, voice_channel_id, err, sizeof(err))) {
-            send_text(client, event->channel_id, err);
-            return;
-        }
-
-        Song song = {0};
-        snprintf(song.url, sizeof(song.url), "%s", query);
-        song.is_search = !youtube_is_url(query);
-
-        char status[256];
-        if (!music_enqueue(event->guild_id, voice_channel_id, &song, status,
-                          sizeof(status))) {
-            send_text(client, event->channel_id, status);
-            return;
-        }
-
-        send_text(client, event->channel_id, status);
+        send_text_feedback("Gateway READY received.");
         return;
     }
 
-    command_help(client, event);
+    if (strcmp(event_name, "VOICE_STATE_UPDATE") == 0) {
+        handle_voice_state_update(ctx, payload);
+        return;
+    }
+
+    if (strcmp(event_name, "MESSAGE_CREATE") != 0) {
+        return;
+    }
+
+    const char *content = json_string_value(json_object_get(payload, "content"));
+    const char *guild_id = json_string_value(json_object_get(payload, "guild_id"));
+    const char *channel_id = json_string_value(json_object_get(payload, "channel_id"));
+    (void)channel_id;
+
+    json_t *author = json_object_get(payload, "author");
+    const char *author_id = author ? json_string_value(json_object_get(author, "id")) : NULL;
+    if (!content || !guild_id || !author_id) {
+        return;
+    }
+
+    if (ctx->bot_user_id && strcmp(author_id, ctx->bot_user_id) == 0) {
+        return;
+    }
+
+    size_t prefix_len = strlen(ctx->prefix);
+    if (strncmp(content, ctx->prefix, prefix_len) != 0) {
+        return;
+    }
+
+    const char *cmdline = content + prefix_len;
+    while (*cmdline == ' ') cmdline++;
+
+    if (strncmp(cmdline, "p", 1) == 0 && (cmdline[1] == ' ' || cmdline[1] == '\0')) {
+        const char *arg = cmdline + 1;
+        while (*arg == ' ') arg++;
+
+        const char *voice_channel = user_voice_channel(ctx, guild_id, author_id);
+        if (voice_channel) {
+            discord_gateway_update_voice_state(gw, guild_id, voice_channel);
+        } else {
+            send_text_feedback("User is not in a voice channel (or state not cached yet).");
+        }
+        handle_play(ctx, guild_id, author_id, arg);
+    } else if (strcmp(cmdline, "skip") == 0) {
+        handle_skip(ctx, guild_id);
+    } else if (strcmp(cmdline, "stop") == 0) {
+        handle_stop(ctx, guild_id);
+    } else if (strcmp(cmdline, "leave") == 0) {
+        handle_leave(ctx, gw, guild_id);
+    } else if (strcmp(cmdline, "help") == 0) {
+        handle_help();
+    }
+}
+
+void commands_cleanup(command_context_t *ctx) {
+    voice_state_entry_t *cursor = ctx->voice_states;
+    while (cursor) {
+        voice_state_entry_t *next = cursor->next;
+        free(cursor);
+        cursor = next;
+    }
+    ctx->voice_states = NULL;
+
+    if (ctx->bot_user_id) {
+        free((char *)ctx->bot_user_id);
+        ctx->bot_user_id = NULL;
+    }
 }
