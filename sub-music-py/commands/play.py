@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from discord.ext import commands
+from utils.ytdl_source import YTDLSource, YTDLSourceError
 
 
 class Play(commands.Cog):
@@ -28,8 +29,11 @@ class Play(commands.Cog):
         except commands.CommandError as exc:
             await ctx.reply(f"❌ {exc}")
             return
-        except Exception as exc:  # noqa: BLE001
-            await ctx.reply(f"❌ Failed to load that track: {exc}")
+        except YTDLSourceError as exc:
+            await ctx.reply(f"❌ Could not load that track: {exc}")
+            return
+        except Exception:
+            await ctx.reply("❌ An unexpected error occurred. Please try again.")
             return
 
         if started:

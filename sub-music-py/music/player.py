@@ -61,7 +61,10 @@ class MusicController:
             if state.voice_client.channel != voice_channel:
                 await state.voice_client.move_to(voice_channel)
         else:
-            state.voice_client = await voice_channel.connect(self_deaf=True)
+            try:
+                state.voice_client = await voice_channel.connect(self_deaf=True)
+            except discord.ClientException as exc:
+                raise commands.CommandError(f"Voice connection failed: {exc}")
 
         state.text_channel = ctx.channel
         return state
@@ -105,15 +108,13 @@ class MusicController:
 
             def after_playback(error: Optional[Exception]) -> None:
                 if error:
-                    self.bot.loop.call_soon_threadsafe(
-                        asyncio.create_task,
+                    # Schedule error notification properly
+                    asyncio.run_coroutine_threadsafe(
                         self._notify_text_channel(state, f"❌ Playback error: {error}"),
+                        self.bot.loop
                     )
-                future = asyncio.run_coroutine_threadsafe(self._advance_queue(guild_id), self.bot.loop)
-                try:
-                    future.result()
-                except Exception as callback_error:  # noqa: BLE001
-                    print(f"[SUB Music] Queue advance failed for guild {guild_id}: {callback_error}")
+                # Schedule queue advancement without blocking
+                asyncio.run_coroutine_threadsafe(self._advance_queue(guild_id), self.bot.loop)
 
             state.voice_client.play(audio_source, after=after_playback)
             await self._notify_text_channel(

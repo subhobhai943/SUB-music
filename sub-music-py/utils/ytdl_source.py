@@ -26,6 +26,10 @@ FFMPEG_OPTIONS: Dict[str, str] = {
 }
 
 
+class YTDLSourceError(Exception):
+    """Custom exception for YouTube audio source errors."""
+
+
 class YTDLSource:
     """Utility wrapper around yt-dlp extraction logic."""
 
@@ -36,15 +40,18 @@ class YTDLSource:
         """Resolve a YouTube link or search query into a playable track."""
 
         loop = asyncio.get_running_loop()
-        data = await loop.run_in_executor(None, lambda: cls._ytdl.extract_info(query, download=False))
+        try:
+            data = await loop.run_in_executor(None, lambda: cls._ytdl.extract_info(query, download=False))
+        except Exception as exc:
+            raise YTDLSourceError(f"Failed to extract track information: {exc}")
 
         if data is None:
-            raise ValueError("No results found.")
+            raise YTDLSourceError("No results found for that query.")
 
         if "entries" in data:
             entries = [entry for entry in data["entries"] if entry]
             if not entries:
-                raise ValueError("No results found.")
+                raise YTDLSourceError("No results found.")
             data = entries[0]
 
         stream_url = data.get("url")
@@ -52,7 +59,7 @@ class YTDLSource:
         title = data.get("title") or "Unknown title"
 
         if not stream_url:
-            raise ValueError("Failed to extract an audio stream for this track.")
+            raise YTDLSourceError("Failed to extract an audio stream for this track.")
 
         return Track(
             title=title,
