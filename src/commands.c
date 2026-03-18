@@ -1,10 +1,29 @@
 #include "commands.h"
-
+#include "lavalink_client.h"
+#include "discord_gateway.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <jansson.h>
 
 static char *dupstr(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *d = malloc(n);
+    if (d) memcpy(d, s, n);
+    return d;
+}
+
+static void get_lavalink_session(command_context_t *ctx) {
+    char session_id[256];
+    if (lavalink_get_session(ctx->lavalink, session_id, sizeof(session_id)) == 0) {
+        lavalink_client_set_session(ctx->lavalink, session_id);
+        send_text_feedback("Lavalink session obtained successfully.");
+    } else {
+        send_text_feedback("Failed to get Lavalink session. Attempting to connect...");
+    }
+}
+
+static voice_state_entry_t *find_voice(command_context_t *ctx, const char *guild_id, const char *user_id, int create) {
     size_t n = strlen(s) + 1;
     char *d = malloc(n);
     if (d) memcpy(d, s, n);
@@ -142,16 +161,13 @@ void commands_handle_dispatch(discord_gateway_t *gw, const char *event_name, jso
     command_context_t *ctx = (command_context_t *)userdata;
 
     if (strcmp(event_name, "READY") == 0) {
-        const char *session_id = json_string_value(json_object_get(payload, "session_id"));
-        if (session_id) {
-            lavalink_client_set_session(ctx->lavalink, session_id);
-        }
         json_t *user = json_object_get(payload, "user");
         const char *user_id = user ? json_string_value(json_object_get(user, "id")) : NULL;
         if (user_id) {
             commands_set_bot_user(ctx, dupstr(user_id));
         }
-        send_text_feedback("Gateway READY received.");
+        send_text_feedback("Gateway READY received. Waiting for Lavalink session...");
+        get_lavalink_session(ctx);
         return;
     }
 
